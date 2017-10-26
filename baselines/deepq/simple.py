@@ -1,16 +1,15 @@
+from backports import tempfile
+import numpy as np
 import os
-import tempfile
-
+import dill
 import tensorflow as tf
 import zipfile
-import cloudpickle
-import numpy as np
 
-import gym
 import baselines.common.tf_util as U
+
+from build_graph import build_act, build_train
 from baselines import logger
 from baselines.common.schedules import LinearSchedule
-from baselines import deepq
 from baselines.deepq.replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
 
 
@@ -20,11 +19,11 @@ class ActWrapper(object):
         self._act_params = act_params
 
     @staticmethod
-    def load(path):
+    def load(path, num_cpu=16):
         with open(path, "rb") as f:
-            model_data, act_params = cloudpickle.load(f)
-        act = deepq.build_act(**act_params)
-        sess = tf.Session()
+            model_data, act_params = dill.load(f)
+        act = build_act(**act_params)
+        sess = U.make_session(num_cpu=num_cpu)
         sess.__enter__()
         with tempfile.TemporaryDirectory() as td:
             arc_path = os.path.join(td, "packed.zip")
@@ -39,11 +38,8 @@ class ActWrapper(object):
     def __call__(self, *args, **kwargs):
         return self._act(*args, **kwargs)
 
-    def save(self, path=None):
+    def save(self, path):
         """Save model to a pickle located at `path`"""
-        if path is None:
-            path = os.path.join(logger.get_dir(), "model.pkl")
-
         with tempfile.TemporaryDirectory() as td:
             U.save_state(os.path.join(td, "model"))
             arc_name = os.path.join(td, "packed.zip")
@@ -56,16 +52,18 @@ class ActWrapper(object):
             with open(arc_name, "rb") as f:
                 model_data = f.read()
         with open(path, "wb") as f:
-            cloudpickle.dump((model_data, self._act_params), f)
+            dill.dump((model_data, self._act_params), f)
 
 
-def load(path):
+def load(path, num_cpu=16):
     """Load act function that was returned by learn function.
 
     Parameters
     ----------
     path: str
         path to the act function pickle
+    num_cpu: int
+        number of cpus to use for executing the policy
 
     Returns
     -------
@@ -73,7 +71,7 @@ def load(path):
         function that takes a batch of observations
         and returns actions.
     """
-    return ActWrapper.load(path)
+    return ActWrapper.load(path, num_cpu=num_cpu)
 
 
 def learn(env,
@@ -85,7 +83,7 @@ def learn(env,
           exploration_final_eps=0.02,
           train_freq=1,
           batch_size=32,
-          print_freq=100,
+          print_freq=1,
           checkpoint_freq=10000,
           learning_starts=1000,
           gamma=1.0,
@@ -95,13 +93,13 @@ def learn(env,
           prioritized_replay_beta0=0.4,
           prioritized_replay_beta_iters=None,
           prioritized_replay_eps=1e-6,
-          param_noise=False,
+          num_cpu=16,
           callback=None):
     """Train a deepq model.
 
     Parameters
     -------
-    env: gym.Env
+    env : gym.Env
         environment to train on
     q_func: (tf.Variable, int, str, bool) -> tf.Variable
         the model that takes the following inputs:
@@ -125,7 +123,6 @@ def learn(env,
         final value of random action probability
     train_freq: int
         update the model every `train_freq` steps.
-        set to None to disable printing
     batch_size: int
         size of a batched sampled from replay buffer for training
     print_freq: int
@@ -152,6 +149,8 @@ def learn(env,
         to 1.0. If set to None equals to max_timesteps.
     prioritized_replay_eps: float
         epsilon to add to the TD errors when updating priorities.
+    num_cpu: int
+        number of cpus to use for training
     callback: (locals, globals) -> None
         function called at every steps with state of the algorithm.
         If callback returns true training stops.
@@ -164,33 +163,25 @@ def learn(env,
     """
     # Create all the functions necessary to train the model
 
-    sess = tf.Session()
+    sess = U.make_session(num_cpu=num_cpu)
     sess.__enter__()
 
-    # capture the shape outside the closure so that the env object is not serialized
-    # by cloudpickle when serializing make_obs_ph
-    observation_space_shape = env.observation_space.shape
     def make_obs_ph(name):
-        return U.BatchInput(observation_space_shape, name=name)
+        return U.BatchInput(env.observation_space.shape, name=name)
 
-    act, train, update_target, debug = deepq.build_train(
+    act, train, update_target, debug = build_train(
         make_obs_ph=make_obs_ph,
         q_func=q_func,
         num_actions=env.action_space.n,
         optimizer=tf.train.AdamOptimizer(learning_rate=lr),
         gamma=gamma,
-        grad_norm_clipping=10,
-        param_noise=param_noise
+        grad_norm_clipping=10
     )
-
     act_params = {
         'make_obs_ph': make_obs_ph,
         'q_func': q_func,
         'num_actions': env.action_space.n,
     }
-
-    act = ActWrapper(act, act_params)
-
     # Create the replay buffer
     if prioritized_replay:
         replay_buffer = PrioritizedReplayBuffer(buffer_size, alpha=prioritized_replay_alpha)
@@ -214,7 +205,6 @@ def learn(env,
     episode_rewards = [0.0]
     saved_mean_reward = None
     obs = env.reset()
-    reset = True
     with tempfile.TemporaryDirectory() as td:
         model_saved = False
         model_file = os.path.join(td, "model")
@@ -223,28 +213,8 @@ def learn(env,
                 if callback(locals(), globals()):
                     break
             # Take action and update exploration to the newest value
-            kwargs = {}
-            if not param_noise:
-                update_eps = exploration.value(t)
-                update_param_noise_threshold = 0.
-            else:
-                update_eps = 0.
-                # Compute the threshold such that the KL divergence between perturbed and non-perturbed
-                # policy is comparable to eps-greedy exploration with eps = exploration.value(t).
-                # See Appendix C.1 in Parameter Space Noise for Exploration, Plappert et al., 2017
-                # for detailed explanation.
-                update_param_noise_threshold = -np.log(1. - exploration.value(t) + exploration.value(t) / float(env.action_space.n))
-                kwargs['reset'] = reset
-                kwargs['update_param_noise_threshold'] = update_param_noise_threshold
-                kwargs['update_param_noise_scale'] = True
-            action = act(np.array(obs)[None], update_eps=update_eps, **kwargs)[0]
-            if isinstance(env.action_space, gym.spaces.MultiBinary):
-                env_action = np.zeros(env.action_space.n)
-                env_action[action] = 1
-            else:
-                env_action = action
-            reset = False
-            new_obs, rew, done, _ = env.step(env_action)
+            action = act(np.array(obs)[None], update_eps=exploration.value(t))[0]
+            new_obs, rew, done, _ = env.step(action)
             # Store transition in the replay buffer.
             replay_buffer.add(obs, action, rew, new_obs, float(done))
             obs = new_obs
@@ -253,7 +223,6 @@ def learn(env,
             if done:
                 obs = env.reset()
                 episode_rewards.append(0.0)
-                reset = True
 
             if t > learning_starts and t % train_freq == 0:
                 # Minimize the error in Bellman's equation on a batch sampled from replay buffer.
@@ -295,4 +264,4 @@ def learn(env,
                 logger.log("Restored model with mean reward: {}".format(saved_mean_reward))
             U.load_state(model_file)
 
-    return act
+    return ActWrapper(act, act_params)

@@ -3,14 +3,14 @@ import tempfile
 import zipfile
 
 from azure.common import AzureMissingResourceHttpError
-try:
-    from azure.storage.blob import BlobService
-except ImportError:
-    from azure.storage.blob import BlockBlobService as BlobService
+from azure.storage.blob import BlobService
 from shutil import unpack_archive
 from threading import Event
 
-# TODOS: use Azure snapshots instead of hacky backups
+"""TODOS:
+   - use Azure snapshots instead of hacky backups
+"""
+
 
 def fixed_list_blobs(service, *args, **kwargs):
     """By defualt list_containers only returns a subset of results.
@@ -34,7 +34,7 @@ def make_archive(source_path, dest_path):
     prefix_path = os.path.dirname(source_path)
     with zipfile.ZipFile(dest_path, "w", compression=zipfile.ZIP_STORED) as zf:
         if os.path.isdir(source_path):
-            for dirname, _subdirs, files in os.walk(source_path):
+            for dirname, subdirs, files in os.walk(source_path):
                 zf.write(dirname, os.path.relpath(dirname, prefix_path))
                 for filename in files:
                     filepath = os.path.join(dirname, filename)
@@ -114,23 +114,18 @@ class Container(object):
             arcpath = os.path.join(td, "archive.zip")
             for backup_blob_name in [blob_name, blob_name + '.backup']:
                 try:
-                    properties = self._service.get_blob_properties(
+                    blob_size = self._service.get_blob_properties(
                         blob_name=backup_blob_name,
                         container_name=self._container_name
-                    )
-                    if hasattr(properties, 'properties'):
-                        # Annoyingly, Azure has changed the API and this now returns a blob
-                        # instead of it's properties with up-to-date azure package.
-                        blob_size = properties.properties.content_length
-                    else:
-                        blob_size = properties['content-length']
+                    )['content-length']
                     if int(blob_size) > 0:
                         self._service.get_blob_to_path(
                             container_name=self._container_name,
                             blob_name=backup_blob_name,
                             file_path=arcpath,
                             max_connections=4,
-                            progress_callback=progress_callback)
+                            progress_callback=progress_callback,
+                            max_retries=10)
                         unpack_archive(arcpath, dest_path)
                         download_done.wait()
                         return True
